@@ -50,7 +50,7 @@
 
   .board{
     background:var(--panel);border:1px solid var(--line);border-radius:10px;
-    padding:12px;position:relative;
+    padding:12px;position:relative;container-type:inline-size;
   }
   .board::after{
     content:"";position:absolute;inset:0;border-radius:10px;pointer-events:none;
@@ -64,12 +64,18 @@
     position:relative;border:1px solid #142433;border-radius:4px;
     background:#0b141d;color:var(--dim);
     display:flex;align-items:center;justify-content:center;
-    font:inherit;font-size:clamp(8px,1.5vw,13px);padding:0;cursor:crosshair;
+    font-family:var(--mono);padding:0;cursor:crosshair;
+    /* Scale the reading to the cell, not the viewport: a 12x12 sector on a
+       phone has far less room per cell than a 6x6 on the same screen. */
+    font-size:clamp(8px,calc(30cqw / var(--n)),14px);
     transition:background .12s,border-color .12s;
-    overflow:hidden;
+    overflow:hidden;touch-action:manipulation;user-select:none;
+    -webkit-tap-highlight-color:transparent;
   }
-  .cell:hover:not(:disabled){background:#12202c;border-color:#25465e}
+  .cell:hover:not(:disabled):not(.done){background:#12202c;border-color:#25465e}
   .cell:disabled{cursor:default}
+  .cell.done{cursor:pointer}
+  .cell.pinned{box-shadow:inset 0 0 0 2px var(--accent)}
   .cell.probed{font-weight:600;letter-spacing:-.02em}
   .cell.cursor{outline:2px solid var(--accent);outline-offset:-2px}
   .cell.ring{border-color:var(--accent);box-shadow:inset 0 0 0 1px rgba(53,224,208,.45)}
@@ -95,7 +101,8 @@
   .log{display:flex;flex-direction:column;gap:4px;min-height:150px}
   .log .row{
     display:flex;justify-content:space-between;gap:8px;padding:5px 8px;
-    background:var(--panel-2);border-radius:4px;border-left:2px solid transparent;cursor:default;
+    background:var(--panel-2);border-radius:4px;border-left:2px solid transparent;
+    cursor:pointer;touch-action:manipulation;-webkit-tap-highlight-color:transparent;
   }
   .log .row:hover{border-left-color:var(--accent);background:#122232}
   .log .row .c{color:var(--dim)}
@@ -142,6 +149,33 @@
     color:#04121a;font-weight:700;
   }
   .card button:hover{filter:brightness(1.12)}
+
+  .log .row.pinned{border-left-color:var(--accent);background:#122232}
+  .hint{display:none;margin-top:8px;color:var(--faint);font-size:12px}
+
+  /* Phone: the board is the game, so give it the screen. Chrome shrinks,
+     the sector goes near full-bleed, and the readout, controls and
+     instructions stack underneath in that order for scrolling. */
+  @media (max-width:620px){
+    :root{--grid-gap:2px}
+    .wrap{padding:14px 10px 44px}
+    h1{font-size:21px;letter-spacing:.2em}
+    .tag{display:none}
+    .hud{margin:12px 0;border-radius:6px}
+    .hud div{padding:6px 9px}
+    .hud b{font-size:9px;letter-spacing:.03em;white-space:nowrap}
+    .hud span{font-size:16px}
+    .stage{gap:14px}
+    .board{padding:6px;border-radius:8px}
+    .board::after{border-radius:8px}
+    .panel{padding:13px}
+    .log{min-height:0}
+    button.act{padding:13px;font-size:13px}
+    .hint{display:block}
+  }
+  @media (hover:none){
+    .hint{display:block}
+  }
 </style>
 
 <div class="wrap">
@@ -163,12 +197,13 @@
     <aside class="panel">
       <h2>READOUT</h2>
       <div class="log" id="log"></div>
+      <div class="hint">Tap a reading &mdash; or a probed cell &mdash; to show its ring.</div>
       <button class="act" id="btnAnalyzer">ANALYZER &middot; OFF</button>
       <button class="act" id="btnRestart">NEW RUN</button>
       <div class="note">
         Each probe reports signal strength &mdash; <strong>higher is closer</strong>. Readings
         carry <strong><span id="noteNoise">&plusmn;2</span> interference</strong>, so one number
-        only narrows it to a fuzzy ring. <strong>Hover a readout</strong> to see that ring, and
+        only narrows it to a fuzzy ring. <strong>Select a reading</strong> to see that ring, and
         where two rings cross. Probe the transmitter itself to clear the sector.
       </div>
       <div class="keys">
@@ -197,7 +232,11 @@
   var modal  = document.getElementById('modal');
 
   var level, score, best, N, probesTotal, noise;
-  var target, probes, analyzerOn, analyzerUsed, cursor, locked;
+  var target, probes, analyzerOn, analyzerUsed, cursor, locked, pinned;
+
+  // Touch has no hover, so the ring overlay — the whole point of the
+  // readout — needs a tap to reach it. Pointer devices keep hover.
+  var canHover = window.matchMedia && window.matchMedia('(hover:hover)').matches;
 
   try { best = parseInt(localStorage.getItem('signal-lost-best') || '0', 10) || 0; }
   catch (e) { best = 0; }
@@ -275,7 +314,7 @@
     N = c.n; probesTotal = c.probes; noise = c.noise;
     target = { x: (Math.random() * N) | 0, y: (Math.random() * N) | 0 };
     probes = [];
-    analyzerOn = false; analyzerUsed = false; locked = false;
+    analyzerOn = false; analyzerUsed = false; locked = false; pinned = null;
     cursor = { x: N >> 1, y: N >> 1 };
     document.getElementById('noteNoise').textContent = '±' + noise.toFixed(1);
     setAnalyzerLabel();
@@ -300,7 +339,17 @@
 
   function onCellClick(e){
     var b = e.currentTarget;
-    doProbe(+b.dataset.x, +b.dataset.y);
+    var x = +b.dataset.x, y = +b.dataset.y;
+    var pr = probedAt(x, y);
+    // Tapping a cell you already probed is the obvious way to ask "where
+    // could the transmitter be, given this reading?" — so answer it.
+    if (pr){ togglePin(pr); return; }
+    doProbe(x, y);
+  }
+
+  function togglePin(p){
+    pinned = (pinned === p) ? null : p;
+    render();
   }
 
   function doProbe(x, y){
@@ -317,6 +366,7 @@
 
     var obs = Math.max(0, Math.min(100, predict(d) + gauss() * noise));
     probes.push({ x: x, y: y, obs: obs });
+    pinned = null;
     render();
     if (probes.length >= probesTotal) lose();
   }
@@ -378,7 +428,11 @@
 
       cell.classList.remove('ring');
       cell.classList.toggle('cursor', cursor.x === x && cursor.y === y);
-      cell.disabled = !!pr || locked;
+      cell.classList.toggle('done', !!pr);
+      cell.classList.toggle('pinned', !!pr && pr === pinned);
+      // Probed cells stay clickable so they can surface their own ring;
+      // doProbe and onCellClick both refuse to re-probe them.
+      cell.disabled = locked;
 
       if (cell.classList.contains('target')) continue;
 
@@ -398,6 +452,7 @@
         }
       }
     }
+    if (pinned) showRing(pinned);
     renderLog();
   }
 
@@ -412,7 +467,7 @@
     }
     probes.forEach(function(p, i){
       var row = document.createElement('div');
-      row.className = 'row';
+      row.className = 'row' + (p === pinned ? ' pinned' : '');
 
       var left = document.createElement('span');
       left.className = 'c';
@@ -424,8 +479,13 @@
 
       row.appendChild(left);
       row.appendChild(val);
-      row.addEventListener('mouseenter', function(){ showRing(p); });
-      row.addEventListener('mouseleave', clearRing);
+      row.addEventListener('click', function(){ togglePin(p); });
+      if (canHover){
+        row.addEventListener('mouseenter', function(){ if (!pinned) showRing(p); });
+        row.addEventListener('mouseleave', function(){
+          if (pinned) showRing(pinned); else clearRing();
+        });
+      }
       logEl.appendChild(row);
     });
   }
@@ -483,6 +543,10 @@
   document.getElementById('btnRestart').addEventListener('click', function(){ hide(); startRun(); });
 
   document.addEventListener('keydown', function(e){
+    // Chorded browser and OS shortcuts share these keys. Without this guard
+    // ctrl+a (select all) toggles the analyzer, which silently halves the
+    // sector score, and ctrl+r starts a fresh run on its way to a reload.
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
     if (modal.classList.contains('show')){
       var mb = document.getElementById('mBtn');
       // The button is focused while the modal is open, so a native activation
